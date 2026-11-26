@@ -79,9 +79,17 @@ mod heap_window_tests;
 /// (`console_heap::null_views`).
 pub const MEM_HEAP_BASE: u32 = 4;
 
+/// A raw null UAV for direct compute loads and stores without a valid window or active lane.
+pub const MEM_HEAP_NULL_UAV: u32 = MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32;
+
 /// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
+
+/// Flag in a memory-windows count next to `HEAP_WINDOWS` (`pso::mem_windows`, the caches' keys):
+/// the direct DXIL translator lowers compute heap-window loads and stores without a branch.
+/// The HLSL path ignores it.
+pub const HEAP_FLAT: u32 = 0x200;
 
 pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {
     windows <= crate::gpu::uma::MAX_WINDOWS
@@ -1540,7 +1548,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let program = code;
     let normalized;
     let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
-        normalized = Options { mem_windows: opt.mem_windows & !HEAP_WINDOWS, heap_windows: true, ..opt.clone() };
+        normalized = Options { mem_windows: opt.mem_windows & !(HEAP_WINDOWS | HEAP_FLAT), heap_windows: true, ..opt.clone() };
         &normalized
     } else {
         opt

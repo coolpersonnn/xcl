@@ -106,6 +106,8 @@ pub const GLOBAL_MAX: u32 = 1_000_000;
 
 /// null views in the CPU-only heap the shared heap's free ranges are filled from
 const NULL_BLOCK: u32 = 4096;
+// Reserve the raw null UAV and keep title SRV/UAV pairs starting at an even index.
+const FIRST_TITLE_VIEW: u32 = crate::gpu::recomp::MEM_HEAP_NULL_UAV + 2;
 
 /// Copy null views (`nulls`, a CPU-only heap of `NULL_BLOCK` of them, even SRV, odd UAV) over
 /// descriptors `from..to` of the heap at `cpu`, a block at a time; an odd `from` starts from
@@ -327,6 +329,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
         fill_nulls(dev, cpu, inc, crate::gpu::recomp::MEM_HEAP_BASE, cap, at);
         (h, at)
     });
+    crate::gpu::recomp::runner::bind_null_raw_window(dev, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu as usize }, inc);
     crate::xlog_info!(
         "console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them ({})",
         if nulls.is_some() { format!("null views in the rest, {} ms", start.elapsed().as_millis()) } else { "no null views past the first: no CPU-only heap for them".into() }
@@ -346,8 +349,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             inc,
             heap,
             cap,
-            // the memory windows' raw UAVs (`set_window_views`) come first
-            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
+            next: FIRST_TITLE_VIEW,
             free: Vec::new(),
             nulls,
         });
@@ -1171,7 +1173,7 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
-                next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(), nulls: None,
+                next: FIRST_TITLE_VIEW, free: Vec::new(), nulls: None,
             });
             let window = (&mut resource as *mut _ as usize, 0x10000);
             // the root-UAV slots past the windows there are: null views, not window 0 again
@@ -1400,8 +1402,8 @@ mod tests {
         vt[2] = retain as usize;
         let mut device = Object { vt: vt.as_ptr() };
         let mut heap = Object { vt: vt.as_ptr() };
-        // room for one page of 256 slots past the null views and the memory windows
-        let base = crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32;
+        // room for one page of 256 title slots
+        let base = FIRST_TITLE_VIEW;
         unsafe {
             *GLOBAL.lock().unwrap() = Some(Global {
                 dev: ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void),

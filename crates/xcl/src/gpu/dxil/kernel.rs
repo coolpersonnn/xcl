@@ -213,7 +213,7 @@ fn translate_entry_with(
 fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
     let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
     let max = if heap { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
-    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, max);
+    let n = (mem_windows & !(crate::gpu::recomp::HEAP_WINDOWS | crate::gpu::recomp::HEAP_FLAT)).clamp(1, max);
     if heap && n > 1 {
         let z = s.m.i32c(0);
         return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
@@ -536,6 +536,16 @@ fn uses_pops(insts: &[Decoded]) -> bool {
     })
 }
 
+/// The branchless form helps when memory-window checks are a material part of the shader.
+/// Keep the smaller shaders guarded, where speculative accesses can cost more than the branches.
+fn memory_heavy(insts: &[Decoded]) -> bool {
+    const MIN_ACCESSES: usize = 128;
+    insts.iter().filter(|d| {
+        matches!(d.enc.name, "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL")
+            && (d.inst.name.contains("_LOAD_") || d.inst.name.contains("_STORE_"))
+    }).take(MIN_ACCESSES).count() == MIN_ACCESSES
+}
+
 impl Lw {
     /// The translator's state for a program (`insts`, its blocks starting at `leaders`) at
     /// `entry`: the shader with its buffers,
@@ -584,6 +594,12 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
+            heap_flat: heap_mem.is_some() && o.mem_windows & crate::gpu::recomp::HEAP_FLAT != 0
+                && match entry {
+                    Entry::Compute(_) => memory_heavy(insts),
+                    Entry::Kernel => true,
+                    _ => false,
+                },
             res,
             fmt_table: None,
             rodata: Vec::new(),
@@ -736,6 +752,24 @@ impl Lw {
             }
         }
         Ok(Kernel { dxil: c, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect(), dispatch_chain })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::memory_heavy;
+    use crate::gpu::rdna2::{decode, encode};
+
+    #[test]
+    fn flat_heap_threshold_counts_only_windowed_loads_and_stores() {
+        let load = encode("S_LOAD_DWORD", "ENC_SMEM", &[("SBASE", 1), ("SDATA", 20)], None).unwrap();
+        let store = encode("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("DATA", 0), ("ADDR", 2), ("SADDR", 0x7D)], None).unwrap();
+        let lds = encode("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None).unwrap();
+        let mut insts: Vec<_> = (0..127).map(|i| decode(&load, i * 8).unwrap()).collect();
+        insts.push(decode(&lds, 127 * 8).unwrap());
+        assert!(!memory_heavy(&insts));
+        insts.push(decode(&store, 128 * 8).unwrap());
+        assert!(memory_heavy(&insts));
     }
 }
 

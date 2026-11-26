@@ -314,22 +314,52 @@ impl Lw {
         out
     }
 
+    /// Select a raw null UAV for an inactive lane or an address outside the memory windows.
+    /// Reads of that view return zero and stores are discarded by D3D12.
+    fn flat_heap_view(&mut self, coherent: bool, guard: Option<Value>) -> RawUav {
+        let window = self.rd(super::lower::VAR_WIN);
+        let inside = self.cmpc(Pred::ULt, window, self.mems.len() as u32);
+        let valid = guard.map_or(inside, |guard| self.land(guard, inside));
+        let index = self.addc(window, crate::gpu::recomp::MEM_HEAP_BASE);
+        let null = self.c(crate::gpu::recomp::MEM_HEAP_NULL_UAV);
+        let index = self.sel(valid, index, null);
+        self.s.heap_raw_buffer_uav(index, coherent)
+    }
+
+    /// `with_mem_many_tys` of `n` dwords for a read (`f` only loads).
     pub(crate) fn with_mem_i32s(
         &mut self,
         guard: Option<Value>,
         n: usize,
         f: &mut dyn FnMut(&mut Lw, RawUav) -> Vec<Value>,
     ) -> Vec<Value> {
+        if let (Some(coherent), true) = (self.heap_mem, self.heap_flat) {
+            if guard.is_some_and(|g| self.s.m.const_u64(g) == Some(0)) {
+                return vec![self.c(0); n];
+            }
+            let m = self.flat_heap_view(coherent, guard);
+            let vals = f(self, m);
+            debug_assert_eq!(vals.len(), n);
+            return vals;
+        }
         let i32 = self.s.m.i32();
         let tys = vec![i32; n];
         self.with_mem_many_tys(guard, &tys, f)
     }
 
+    /// `with_mem_many_tys` for plain stores (`f` only writes).
     pub(crate) fn with_mem_void(
         &mut self,
         guard: Option<Value>,
         f: &mut dyn FnMut(&mut Lw, RawUav),
     ) {
+        if let (Some(coherent), true) = (self.heap_mem, self.heap_flat) {
+            if !guard.is_some_and(|g| self.s.m.const_u64(g) == Some(0)) {
+                let m = self.flat_heap_view(coherent, guard);
+                f(self, m);
+            }
+            return;
+        }
         let _ = self.with_mem_many_tys(guard, &[], &mut |lw, m| {
             f(lw, m);
             Vec::new()
