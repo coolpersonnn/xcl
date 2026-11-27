@@ -29,6 +29,11 @@ const SCC_CODE: u64 = 253;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaveLocal { NoCrossHalf, SingleWave }
+
+/// `XCL_WAVE_LOCAL=1`: run eligible wave64 compute shaders at wave32 without cross-half exchange.
+pub fn enabled() -> bool {
+    std::env::var("XCL_WAVE_LOCAL").is_ok_and(|v| v == "1")
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reject { pub pc: u64, pub reason: &'static str }
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -852,6 +857,276 @@ mod tests {
             target_rows.sort();
             eprintln!("target {} CS hashes matched={}/{}:", targets.len(), target_rows.len(), targets.len());
             for row in target_rows { eprintln!("  {row}"); }
+        }
+    }
+
+    fn code_bytes(ops: &[Op]) -> (Vec<u8>, Vec<Decoded>) {
+        let bytes: Vec<u8> = ops.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
+        let (mut insts, mut off) = (Vec::new(), 0usize);
+        while off + 4 <= bytes.len() {
+            let d = rdna2::decode(&bytes[off..], off as u64).unwrap();
+            off += d.len;
+            insts.push(d);
+        }
+        rdna2::resolve_far_jumps(&mut insts);
+        (bytes, insts)
+    }
+
+    fn gpu_w32_ready() -> bool {
+        use super::super::{dxc, runner};
+        match (runner::adapter(), runner::wave32_supported(), dxc::location()) {
+            (Ok(_), Ok(true), Ok(_)) => true,
+            (a, w, d) => {
+                runner::skip_test(if a.is_err() || w.is_err() { "no GPU" } else if d.is_err() { "no DXC" } else { "no wave32" });
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_no_cross_half_matches_split_wave64() {
+        if !gpu_w32_ready() { return; }
+        use super::super::{dxc, lower_dxil, runner, translate, Mode, Options};
+        use crate::gpu::dxil::kernel::{translate_compute_wave_local, KernelOptions};
+        for threads in [[64, 1, 1], [8, 8, 1], [48, 1, 1], [128, 1, 1]] {
+            let two_d = threads[1] > 1;
+            let cs_i = super::super::CsInterface { threads, user_sgprs: 8, tgid: [true, false, false], tg_size: false, tid_components: if two_d { 2 } else { 1 } };
+            let mut head: Vec<Op> = Vec::new();
+            if two_d {
+                head.push(op("V_LSHL_ADD_U32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 257), ("SRC1", 131), ("SRC2", 256)]));
+            }
+            head.extend([
+                op("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 3), ("SRC0", 160), ("VSRC1", 0)]),
+                op("DS_SWIZZLE_B32", "ENC_DS", vec![("VDST", 4), ("ADDR", 3), ("OFFSET0", 0x1F), ("OFFSET1", 0x04)]),
+                op("V_PERMLANEX16_B32", "ENC_VOP3", vec![("VDST", 5), ("SRC0", 259), ("SRC1", 128), ("SRC2", 128)]),
+                op("V_CMP_LT_U32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 133), ("SRC1", 256)]),
+                op("S_XOR_B64", "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 0), ("SSRC1", 193)]),
+                op("S_AND_SAVEEXEC_B64", "ENC_SOP1", vec![("SDST", 2), ("SSRC0", 0)]),
+            ]);
+            let br_body = [op("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 4), ("SRC0", 164), ("VSRC1", 4)])];
+            let br_skip = (code_bytes(&br_body).0.len() / 4) as u64;
+            head.push(op("S_CBRANCH_EXECZ", "ENC_SOPP", vec![("SIMM16", br_skip)]));
+            head.extend(br_body);
+            head.extend([
+                op("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 2)]),
+                op("S_WQM_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 126)]),
+                op("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 5), ("SRC0", 144), ("VSRC1", 5)]),
+                op("V_XOR_B32", "ENC_VOP2", vec![("VDST", 6), ("SRC0", 261), ("VSRC1", 4)]),
+                op("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 7), ("SRC0", 130), ("VSRC1", 0)]),
+                op("V_LSHL_ADD_U32", "ENC_VOP3", vec![("VDST", 7), ("SRC0", 8), ("SRC1", 137), ("SRC2", 263)]),
+                op("BUFFER_STORE_DWORD", "ENC_MUBUF", vec![("VDATA", 6), ("VADDR", 7), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1)]),
+                op("S_ENDPGM", "ENC_SOPP", vec![]),
+            ]);
+            let (code, insts) = code_bytes(&head);
+            let split_t = translate(&code, &Options { mode: Mode::Compute(cs_i.clone()), wave64: true, split_wave64: true, wave_local: false, ..Default::default() }).unwrap();
+            assert!(split_t.complete(), "{:?}", split_t.unsupported_why);
+            assert!(split_t.wave_local.is_none());
+            let split_dxil = dxc::compile(&split_t.hlsl, "main", "cs_6_6", &[]).unwrap();
+
+            let wl_t = translate(&code, &Options { mode: Mode::Compute(cs_i.clone()), wave64: true, split_wave64: true, wave_local: true, ..Default::default() }).unwrap();
+            assert!(wl_t.complete(), "{:?}", wl_t.unsupported_why);
+            assert_eq!(wl_t.wave_local, Some(WaveLocal::NoCrossHalf));
+            assert!(wl_t.hlsl.contains("[WaveSize(32)]"), "threads={threads:?}");
+            assert!(!wl_t.hlsl.contains("xcl_x_meet") && !wl_t.hlsl.contains("xcl_x_ballot"), "threads={threads:?}");
+            let wl_hlsl_dxil = dxc::compile(&wl_t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let ko = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+            let wl_direct = translate_compute_wave_local(&code, ko, &cs_i).unwrap();
+            assert_eq!(wl_direct.wave_local, Some(WaveLocal::NoCrossHalf));
+            let wl_perlane = lower_dxil::compute_wave_local(&insts, &cs_i).unwrap();
+
+            let mut io = vec![0u32; 8];
+            io[4..8].copy_from_slice(&[0x100, 0, 0x1000, 0]);
+            let mem = vec![0u32; 0x500 / 4];
+            let expected = runner::dispatch(&split_dxil, [1, 1, 1], &io, &mem).unwrap();
+            for (tag, dxil) in [("hlsl", &wl_hlsl_dxil), ("direct", &wl_direct.dxil), ("per-lane", &wl_perlane)] {
+                let actual = runner::dispatch(dxil, [1, 1, 1], &io, &mem).unwrap();
+                assert_eq!(actual, expected, "NoCrossHalf {tag} mismatch for threads={threads:?}");
+            }
+            if threads == [128, 1, 1] && std::env::var_os("XCL_SAMPLE_WAVE_LOCAL_TIMING").is_some() {
+                let split_direct = crate::gpu::dxil::kernel::translate_compute(&code, ko, &cs_i).unwrap();
+                let split_perlane = lower_dxil::compute_split(&insts, &cs_i).unwrap();
+                let groups = [2048, 1, 1];
+                let bytes = groups[0] * 512;
+                io[6] = bytes;
+                let mem = vec![0; ((0x100 + bytes) / 4) as usize];
+                for (tag, split, local) in [
+                    ("hlsl", split_dxil.as_slice(), wl_hlsl_dxil.as_slice()),
+                    ("direct", split_direct.dxil.as_slice(), wl_direct.dxil.as_slice()),
+                    ("per-lane", split_perlane.as_slice(), wl_perlane.as_slice()),
+                ] {
+                    let split_output = runner::dispatch(split, groups, &io, &mem).unwrap();
+                    let local_output = runner::dispatch(local, groups, &io, &mem).unwrap();
+                    assert_eq!(split_output, local_output, "profiled {tag} output");
+                    let mut samples = [Vec::new(), Vec::new()];
+                    for round in 0..4 {
+                        for pass in 0..2 {
+                            let form = (round + pass) % 2;
+                            let times = runner::dispatch_timed([split, local][form], groups, &io, &mem, 12).unwrap();
+                            samples[form].extend_from_slice(&times[2..]);
+                        }
+                    }
+                    let [split_us, local_us] = samples.map(|mut times| {
+                        times.sort_by(f64::total_cmp);
+                        let mid = times.len() / 2;
+                        500.0 * (times[mid - 1] + times[mid])
+                    });
+                    eprintln!("wave-local GPU {tag}: 40 samples/form, split {split_us:.3} us, local {local_us:.3} us");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_single_wave_matches_split_wave64() {
+        if !gpu_w32_ready() { return; }
+        use super::super::{dxc, lower_dxil, runner, translate, Mode, Options};
+        use crate::gpu::dxil::kernel::{translate_compute_wave_local, KernelOptions};
+        for (threads, use_cutoff) in [([32, 1, 1], true), ([16, 1, 1], false), ([24, 1, 1], false)] {
+            let cs_i = super::super::CsInterface { threads, user_sgprs: 16, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+            let mut ops: Vec<Op> = if use_cutoff {
+                vec![op("V_CMP_LE_U32", "ENC_VOPC", vec![("SRC0", 151), ("VSRC1", 0)])]
+            } else {
+                vec![
+                    op("V_AND_B32", "ENC_VOP2", vec![("VDST", 9), ("SRC0", 129), ("VSRC1", 0)]),
+                    op("V_CMP_EQ_U32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 9)]),
+                ]
+            };
+            ops.push(op("S_AND_SAVEEXEC_B64", "ENC_SOP1", vec![("SDST", 2), ("SSRC0", 106)]));
+            let body = [
+                op("S_BCNT1_I32_B64", "ENC_SOP1", vec![("SDST", 4), ("SSRC0", 126)]),
+                op("S_FF1_I32_B64", "ENC_SOP1", vec![("SDST", 5), ("SSRC0", 126)]),
+                op("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 1), ("SRC0", 193), ("SRC1", 128)]),
+                op("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 1), ("SRC0", 193), ("SRC1", 257)]),
+                op("V_CMP_EQ_U32", "ENC_VOPC", vec![("SRC0", 5), ("VSRC1", 1)]),
+                op("S_AND_SAVEEXEC_B64", "ENC_SOP1", vec![("SDST", 6), ("SSRC0", 106)]),
+                op("V_MOV_B32", "ENC_VOP1", vec![("VDST", 2), ("SRC0", 4)]),
+                op("V_MOV_B32", "ENC_VOP1", vec![("VDST", 8), ("SRC0", 128)]),
+                op("BUFFER_ATOMIC_ADD", "ENC_MUBUF", vec![("VDATA", 2), ("VADDR", 8), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)]),
+                op("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 6)]),
+                op("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 16), ("SRC0", 258)]),
+                op("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 3), ("SRC0", 126), ("SRC1", 128)]),
+                op("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 3), ("SRC0", 127), ("SRC1", 259)]),
+                op("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 4), ("SRC0", 16), ("VSRC1", 3)]),
+                op("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 4), ("SRC0", 130), ("VSRC1", 4)]),
+                op("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 9), ("SRC0", 144), ("VSRC1", 0)]),
+                op("BUFFER_STORE_DWORD", "ENC_MUBUF", vec![("VDATA", 9), ("VADDR", 4), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)]),
+            ];
+            let skip = (code_bytes(&body).0.len() / 4) as u64;
+            ops.push(op("S_CBRANCH_EXECZ", "ENC_SOPP", vec![("SIMM16", skip)]));
+            ops.extend(body);
+            ops.extend([op("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 2)]), op("S_ENDPGM", "ENC_SOPP", vec![])]);
+            let (code, insts) = code_bytes(&ops);
+            assert_eq!(analyze(&insts, &cs_i), Ok(WaveLocal::SingleWave));
+
+            let split_t = translate(&code, &Options { mode: Mode::Compute(cs_i.clone()), wave64: true, split_wave64: true, wave_local: false, ..Default::default() }).unwrap();
+            assert!(split_t.complete(), "{:?}", split_t.unsupported_why);
+            let split_dxil = dxc::compile(&split_t.hlsl, "main", "cs_6_6", &[]).unwrap();
+
+            let wl_t = translate(&code, &Options { mode: Mode::Compute(cs_i.clone()), wave64: true, split_wave64: true, wave_local: true, ..Default::default() }).unwrap();
+            assert!(wl_t.complete(), "{:?}", wl_t.unsupported_why);
+            assert_eq!(wl_t.wave_local, Some(WaveLocal::SingleWave));
+            assert!(wl_t.hlsl.contains("[WaveSize(32)]") && !wl_t.hlsl.contains("xcl_x_meet"));
+            let wl_hlsl_dxil = dxc::compile(&wl_t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let ko = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+            let wl_direct = translate_compute_wave_local(&code, ko, &cs_i).unwrap();
+            assert_eq!(wl_direct.wave_local, Some(WaveLocal::SingleWave));
+            let wl_perlane = lower_dxil::compute_wave_local(&insts, &cs_i).unwrap();
+
+            let mut io = vec![0u32; 16];
+            io[8..12].copy_from_slice(&[0x100, 0, 0x100, 0]);
+            io[12..16].copy_from_slice(&[0x200, 0, 0x1000, 0]);
+            let mem = vec![0u32; 0x600 / 4];
+            let ref_out = runner::dispatch(&split_dxil, [1, 1, 1], &io, &mem).unwrap();
+            let expected_cnt = ref_out[0x100 / 4] as usize;
+            assert!(expected_cnt > 0);
+            let mut expected_vals = ref_out[0x200 / 4..0x200 / 4 + expected_cnt].to_vec();
+            expected_vals.sort_unstable();
+            for (tag, dxil) in [("hlsl", &wl_hlsl_dxil), ("direct", &wl_direct.dxil), ("per-lane", &wl_perlane)] {
+                let actual = runner::dispatch(dxil, [1, 1, 1], &io, &mem).unwrap();
+                assert_eq!(actual[0x100 / 4] as usize, expected_cnt, "SingleWave {tag} count threads={threads:?}");
+                let mut got = actual[0x200 / 4..0x200 / 4 + expected_cnt].to_vec();
+                got.sort_unstable();
+                assert_eq!(got, expected_vals, "SingleWave {tag} items threads={threads:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_rejected_shader_falls_back_to_split() {
+        if !gpu_w32_ready() { return; }
+        use super::super::{dxc, lower_dxil, runner, translate, Mode, Options};
+        use crate::gpu::dxil::kernel::{translate_compute_wave_local, KernelOptions};
+        let cs_i = cs([64, 1, 1]);
+        let (code, insts) = code_bytes(&[
+            op("V_READLANE_B32", "ENC_VOP3", vec![("VDST", 10), ("SRC0", 256), ("SRC1", 168)]),
+            op("V_MOV_B32", "ENC_VOP1", vec![("VDST", 1), ("SRC0", 10)]),
+            op("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 2), ("SRC0", 130), ("VSRC1", 0)]),
+            op("BUFFER_STORE_DWORD", "ENC_MUBUF", vec![("VDATA", 1), ("VADDR", 2), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1)]),
+            op("S_ENDPGM", "ENC_SOPP", vec![]),
+        ]);
+        let split_t = translate(&code, &Options { mode: Mode::Compute(cs_i.clone()), wave64: true, split_wave64: true, wave_local: false, ..Default::default() }).unwrap();
+        let wl_t = translate(&code, &Options { mode: Mode::Compute(cs_i.clone()), wave64: true, split_wave64: true, wave_local: true, ..Default::default() }).unwrap();
+        assert!(wl_t.wave_local.is_none());
+        assert!(wl_t.hlsl.contains("xcl_x_rla_uniform"));
+        assert_eq!(translate_compute_wave_local(&code, KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 }, &cs_i).unwrap().wave_local, None);
+        assert_eq!(lower_dxil::compute_wave_local(&insts, &cs_i).unwrap_err().split(" @").next().unwrap(), "v_readlane/v_writelane crosses halves");
+        let dx_ref = dxc::compile(&split_t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let dx_wl = dxc::compile(&wl_t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let mut io = vec![0u32; 8];
+        io[4..8].copy_from_slice(&[0x100, 0, 0x1000, 0]);
+        let mem = vec![0u32; 0x300 / 4];
+        let out_ref = runner::dispatch(&dx_ref, [1, 1, 1], &io, &mem).unwrap();
+        let out_wl = runner::dispatch(&dx_wl, [1, 1, 1], &io, &mem).unwrap();
+        assert_eq!(out_wl, out_ref);
+        assert!(out_wl[0x100 / 4..0x100 / 4 + 64].iter().all(|&x| x == 40));
+    }
+
+    #[test]
+    fn retail_wave_local_bench() {
+        let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+        if path.trim().is_empty() { return; }
+        use super::super::{dxc, fssm_wave64, lower_dxil, translate, Mode, Options};
+        use crate::gpu::dxil::kernel::{translate_compute, translate_compute_wave_local, KernelOptions};
+        let data = std::fs::read(&path).unwrap();
+        let targets = sample_hashes();
+        let mut seen = 0usize;
+        for rec in pack::scan(&data, 0x40) {
+            let Some(blob) = pack::inflate(&data, &rec) else { continue };
+            let h = shader::fnv64(&blob);
+            if !targets.is_empty() && !targets.contains(&h) { continue; }
+            let Some(sh) = xbox::parse(&blob) else { continue };
+            for f in &sh.fssm {
+                let Some(Mode::Compute(cs)) = super::super::interface(&blob, &sh, f) else { continue };
+                let Some(p) = f.programs.first() else { continue };
+                let code = &f.data[p.offset..p.offset + p.len];
+                if !fssm_wave64(f, code) { continue; }
+                let (mut insts, mut off) = (Vec::new(), 0usize);
+                while off + 4 <= code.len() { let Ok(d) = rdna2::decode(&code[off..], off as u64) else { break }; off += d.len; insts.push(d); }
+                if off != code.len() { continue; }
+                rdna2::resolve_far_jumps(&mut insts);
+                if targets.is_empty() && analyze(&insts, &cs).is_err() { continue; }
+                let o_sp = Options { mode: Mode::Compute(cs.clone()), wave64: true, split_wave64: true, wave_local: false, ..Default::default() };
+                let o_wl = Options { wave_local: true, ..o_sp.clone() };
+                let (t_sp, t_wl) = (translate(code, &o_sp).unwrap(), translate(code, &o_wl).unwrap());
+                let (t0, dx_sp) = (std::time::Instant::now(), dxc::compile(&t_sp.hlsl, "main", "cs_6_6", &[]).unwrap());
+                let ms_sp = t0.elapsed().as_secs_f64() * 1000.0;
+                let (t1, dx_wl) = (std::time::Instant::now(), dxc::compile(&t_wl.hlsl, "main", "cs_6_6", &[]).unwrap());
+                let ms_wl = t1.elapsed().as_secs_f64() * 1000.0;
+                let ko = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+                let k_sp = translate_compute(code, ko, &cs).map(|k| k.dxil.len());
+                let k_wl = translate_compute_wave_local(code, ko, &cs).map(|k| k.dxil.len());
+                let pl_sp = lower_dxil::compute_split(&insts, &cs).map(|b| b.len());
+                let pl_wl = lower_dxil::compute_wave_local(&insts, &cs).map(|b| b.len());
+                eprintln!(
+                    "{h:016x} {:?}: HLSL {}B/{:.1}ms/{}B vs WL {}B/{:.1}ms/{}B (meet={}) | #1426 {:?} vs {:?} | per-lane {:?} vs {:?}",
+                    t_wl.wave_local, t_sp.hlsl.len(), ms_sp, dx_sp.len(), t_wl.hlsl.len(), ms_wl, dx_wl.len(),
+                    t_wl.hlsl.contains("xcl_x_meet"), k_sp, k_wl, pl_sp, pl_wl
+                );
+                if targets.is_empty() {
+                    seen += 1;
+                    if seen >= 4 { return; }
+                }
+            }
         }
     }
 }
